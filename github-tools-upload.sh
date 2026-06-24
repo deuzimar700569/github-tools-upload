@@ -546,24 +546,42 @@ update_specific_repo() {
     print_header
     echo "🔄 ATUALIZAR REPOSITÓRIO ESPECÍFICO"
     echo "────────────────────────────────────"
-    
+
     [[ -z "$GITHUB_USER" ]] && read -p "Usuário GitHub: " GITHUB_USER
-    read -p "Nome do repositório: " repo_name
-    [[ -z "$repo_name" ]] && return
-    
+
+    while true; do
+        read -p "Nome do repositório (ou URL): " repo_input
+        [[ -z "$repo_input" ]] && return
+
+        if echo "$repo_input" | grep -qE 'github\.com[:/]'; then
+            repo_name=$(echo "$repo_input" | sed 's|.*github.com[:/]||;s|\.git$||;s|/$||')
+        else
+            repo_name=$(basename "$repo_input" | sed 's|\.git$||')
+        fi
+
+        if [[ -z "$repo_name" ]]; then
+            print_error "Nome inválido"
+            continue
+        fi
+        break
+    done
+
+    print_info "Repositório: $GITHUB_USER/$repo_name"
+
     local repo_url
     if [[ "$METHOD" == "ssh" ]]; then
         repo_url="git@github.com:$GITHUB_USER/$repo_name.git"
     else
         repo_url="https://github.com/$GITHUB_USER/$repo_name.git"
     fi
-    
+
     local dest_dir="$REPOS_DIR/$repo_name"
     read -p "Diretório destino [$dest_dir]: " custom_dir
     [[ -n "$custom_dir" ]] && dest_dir="$custom_dir"
-    
+    mkdir -p "$dest_dir"
+
     clone_or_pull_repo "$repo_url" "$dest_dir" "$repo_name" || return
-    
+
     if [[ -d "$dest_dir/.git" ]]; then
         echo ""
         read -p "Fazer commit e push de alterações? (s/n): " do_commit

@@ -808,13 +808,24 @@ update_repos_menu() {
     case $choice in
         1)
             [[ -z "$GITHUB_USER" ]] && read -p "Usuário GitHub: " GITHUB_USER
-            read -p "Nome do repositório: " repo_name
-            [[ -z "$repo_name" ]] && return
+            while true; do
+                read -p "Nome do repositório (ou URL): " repo_input
+                [[ -z "$repo_input" ]] && return
+                if echo "$repo_input" | grep -qE 'github\.com[:/]'; then
+                    repo_name=$(echo "$repo_input" | sed 's|.*github.com[:/]||;s|\.git$||;s|/$||')
+                else
+                    repo_name=$(basename "$repo_input" | sed 's|\.git$||')
+                fi
+                [[ -n "$repo_name" ]] && break
+                print_error "Nome inválido"
+            done
+            print_info "Repositório: $GITHUB_USER/$repo_name"
             local repo_url="git@github.com:$GITHUB_USER/$repo_name.git"
             [[ "$METHOD" == "https" ]] && repo_url="https://github.com/$GITHUB_USER/$repo_name.git"
             local dest_dir="$REPOS_DIR/$repo_name"
             read -p "Diretório destino [$dest_dir]: " custom_dir
             [[ -n "$custom_dir" ]] && dest_dir="$custom_dir"
+            mkdir -p "$dest_dir"
             clone_or_pull_repo "$repo_url" "$dest_dir" "$repo_name"
             read -p "Commit e push? (s/n): " do_cp
             [[ "$do_cp" == "s" ]] && { read -p "Mensagem: " msg; commit_and_push "$dest_dir" "$msg"; }
