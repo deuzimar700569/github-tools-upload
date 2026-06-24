@@ -2,7 +2,7 @@
 
 # ============================================
 # GITHUB TOOLS UPLOAD MANAGER
-# Upload ferramentas via SSH ou HTTPS
+# Upload/Update ferramentas via SSH ou HTTPS
 # ============================================
 
 # Cores para output
@@ -11,12 +11,14 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+MAGENTA='\033[0;35m'
+NC='\033[0m'
 
 # Configurações
 CONFIG_FILE="$HOME/.github_tools_config"
 LOG_FILE="$HOME/github_upload.log"
 DEFAULT_DIR="$HOME/tools"
+REPOS_DIR="$HOME/repos"
 
 # Funções de output
 print_header() {
@@ -42,6 +44,7 @@ load_config() {
         REPO_NAME=""
         METHOD="ssh"
         TARGET_DIR="$DEFAULT_DIR"
+        REPOS_DIR="$HOME/repos"
     fi
 }
 
@@ -52,6 +55,7 @@ GITHUB_USER="$GITHUB_USER"
 REPO_NAME="$REPO_NAME"
 METHOD="$METHOD"
 TARGET_DIR="$TARGET_DIR"
+REPOS_DIR="$REPOS_DIR"
 EOF
     print_success "Configuração salva em $CONFIG_FILE"
 }
@@ -176,8 +180,12 @@ setup_repo() {
     read -p "Diretório das ferramentas [$TARGET_DIR]: " new_dir
     [[ -n "$new_dir" ]] && TARGET_DIR="$new_dir"
     
-    # Criar diretório se não existir
-    mkdir -p "$TARGET_DIR"
+    # Diretório de repositórios
+    read -p "Diretório para repositórios [$REPOS_DIR]: " new_repos
+    [[ -n "$new_repos" ]] && REPOS_DIR="$new_repos"
+    
+    # Criar diretórios se não existirem
+    mkdir -p "$TARGET_DIR" "$REPOS_DIR"
     
     save_config
 }
@@ -366,6 +374,352 @@ do_upload() {
     esac
 }
 
+# ============================================
+# SEÇÃO DE ATUALIZAÇÃO DE REPOSITÓRIOS
+# ============================================
+
+# Detectar branch padrão (main ou master)
+detect_default_branch() {
+    local repo_dir="$1"
+    cd "$repo_dir" 2>/dev/null || return
+    git branch -r | grep -oP 'origin/\K(main|master)' | head -1 || echo "main"
+}
+
+# Clonar ou atualizar um repositório
+clone_or_pull_repo() {
+    local repo_url="$1"
+    local dest_dir="$2"
+    local repo_name="$3"
+
+    if [[ -d "$dest_dir/.git" ]]; then
+        print_info "Repositório já existe. Atualizando..."
+        cd "$dest_dir" || return 1
+        local branch=$(detect_default_branch "$dest_dir")
+        git stash --include-untracked 2>/dev/null
+        if git pull origin "$branch" 2>/dev/null; then
+            print_success "✓ $repo_name atualizado"
+            return 0
+        else
+            print_warning "Falha ao atualizar $repo_name (pode haver conflitos)"
+            return 1
+        fi
+    else
+        print_info "Clonando $repo_name..."
+        mkdir -p "$(dirname "$dest_dir")"
+        if git clone "$repo_url" "$dest_dir" 2>/dev/null; then
+            print_success "✓ $repo_name clonado"
+            return 0
+        else
+            print_error "Falha ao clonar $repo_name"
+            return 1
+        fi
+    fi
+}
+
+# Status do repositório
+show_repo_status() {
+    local repo_dir="$1"
+    cd "$repo_dir" 2>/dev/null || return
+    
+    local branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    local remote=$(git remote get-url origin 2>/dev/null | sed 's/.*github.com[:\/]//;s/\.git$//')
+    local ahead=$(git rev-list --count "@{upstream}"..HEAD 2>/dev/null || echo 0)
+    local behind=$(git rev-list --count HEAD.."@{upstream}" 2>/dev/null || echo 0)
+    local modified=$(git status --porcelain | wc -l)
+    
+    if [[ $ahead -gt 0 || $behind -gt 0 || $modified -gt 0 ]]; then
+        echo -e "  ${MAGENTA}$(basename "$repo_dir")${NC} ($remote)"
+        echo -e "    Branch: $branch | Ahead: $ahead | Behind: $behind | Modificados: $modified"
+    else
+        echo -e "  ${GREEN}$(basename "$repo_dir")${NC} ($remote) ✓ OK"
+    fi
+}
+
+# Fazer commit e push de alterações
+commit_and_push() {
+    local repo_dir="$1"
+    local message="$2"
+    
+    cd "$repo_dir" || return 1
+    
+    git add -A
+    if [[ -z "$(git status --porcelain)" ]]; then
+        print_warning "Nenhuma alteração em $(basename "$repo_dir")"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Alterações em $(basename "$repo_dir"):${NC}"
+    git status --short
+    echo ""
+    
+    [[ -z "$message" ]] && message="Update $(date '+%Y-%m-%d %H:%M')"
+    
+    git commit -m "$message" || return 1
+    
+    local branch=$(git rev-parse --abbrev-ref HEAD)
+    if git push origin "$branch" 2>/dev/null; then
+        print_success "✓ $(basename "$repo_dir") enviado com sucesso"
+        log_action "Update: $(basename "$repo_dir") - $message"
+        return 0
+    else
+        print_error "Falha ao enviar $(basename "$repo_dir")"
+        return 1
+    fi
+}
+
+# Listar repositórios no diretório
+list_repos() {
+    local base_dir="$1"
+    local repos=()
+    
+    while IFS= read -r -d '' dir; do
+        repos+=("$dir")
+    done < <(find "$base_dir" -maxdepth 2 -name ".git" -type d -printf '%h\0' 2>/dev/null)
+    
+    printf '%s\n' "${repos[@]}"
+}
+
+# Menu de atualização de repositórios
+update_repos_menu() {
+    print_header
+    echo "🔄 ATUALIZAR REPOSITÓRIOS"
+    echo "─────────────────────────"
+    
+    # Verificar gh CLI
+    local has_gh=false
+    command -v gh &>/dev/null && has_gh=true
+    
+    echo ""
+    echo "Opções:"
+    echo "1) Atualizar repositório específico do GitHub"
+    echo "2) Digitalizar diretório por repositórios"
+    
+    if $has_gh; then
+        echo "3) 📦 Listar e clonar repositórios do seu GitHub (via gh)"
+        echo "4) 🔄 Atualizar TODOS os repositórios de um diretório"
+    else
+        echo "3) 🔄 Atualizar TODOS os repositórios de um diretório"
+        echo ""
+        echo -e "${YELLOW}Dica: instale 'gh' (GitHub CLI) para mais opções: sudo apt install gh${NC}"
+    fi
+    
+    echo "0) Voltar"
+    echo ""
+    
+    read -p "Escolha: " update_choice
+    
+    case $update_choice in
+        1)
+            update_specific_repo
+            ;;
+        2)
+            scan_and_update_repos
+            ;;
+        3)
+            if $has_gh; then
+                gh_list_and_clone
+            else
+                update_all_repos_in_dir
+            fi
+            ;;
+        4)
+            if $has_gh; then
+                update_all_repos_in_dir
+            else
+                print_warning "Opção inválida"
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_error "Opção inválida"
+            ;;
+    esac
+    
+    echo ""
+    read -p "Pressione Enter para continuar..."
+}
+
+# Atualizar repositório específico do GitHub
+update_specific_repo() {
+    print_header
+    echo "🔄 ATUALIZAR REPOSITÓRIO ESPECÍFICO"
+    echo "────────────────────────────────────"
+    
+    [[ -z "$GITHUB_USER" ]] && read -p "Usuário GitHub: " GITHUB_USER
+    read -p "Nome do repositório: " repo_name
+    [[ -z "$repo_name" ]] && return
+    
+    local repo_url
+    if [[ "$METHOD" == "ssh" ]]; then
+        repo_url="git@github.com:$GITHUB_USER/$repo_name.git"
+    else
+        repo_url="https://github.com/$GITHUB_USER/$repo_name.git"
+    fi
+    
+    local dest_dir="$REPOS_DIR/$repo_name"
+    read -p "Diretório destino [$dest_dir]: " custom_dir
+    [[ -n "$custom_dir" ]] && dest_dir="$custom_dir"
+    
+    clone_or_pull_repo "$repo_url" "$dest_dir" "$repo_name" || return
+    
+    if [[ -d "$dest_dir/.git" ]]; then
+        echo ""
+        read -p "Fazer commit e push de alterações? (s/n): " do_commit
+        if [[ "$do_commit" == "s" ]]; then
+            read -p "Mensagem do commit: " msg
+            commit_and_push "$dest_dir" "$msg"
+        fi
+    fi
+}
+
+# Digitalizar diretório e mostrar status
+scan_and_update_repos() {
+    print_header
+    echo "🔍 DIGITALIZAR REPOSITÓRIOS"
+    echo "───────────────────────────"
+    
+    local scan_dir="$REPOS_DIR"
+    read -p "Diretório para digitalizar [$scan_dir]: " custom_scan
+    [[ -n "$custom_scan" ]] && scan_dir="$custom_scan"
+    
+    if [[ ! -d "$scan_dir" ]]; then
+        print_error "Diretório não encontrado: $scan_dir"
+        return
+    fi
+    
+    mapfile -t repos < <(list_repos "$scan_dir")
+    
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        print_warning "Nenhum repositório git encontrado em $scan_dir"
+        return
+    fi
+    
+    echo ""
+    echo "Repositórios encontrados:"
+    echo "─────────────────────────"
+    for repo in "${repos[@]}"; do
+        show_repo_status "$repo"
+    done
+    
+    echo ""
+    read -p "Deseja atualizar (git pull) todos? (s/n): " do_pull
+    if [[ "$do_pull" == "s" ]]; then
+        for repo in "${repos[@]}"; do
+            local name=$(basename "$repo")
+            cd "$repo" || continue
+            local branch=$(detect_default_branch "$repo")
+            git stash --include-untracked 2>/dev/null
+            if git pull origin "$branch" 2>/dev/null; then
+                print_success "✓ $name atualizado"
+            else
+                print_warning "✗ $name - conflitos ou erros"
+            fi
+        done
+    fi
+    
+    echo ""
+    read -p "Fazer commit e push em repositórios com alterações? (s/n): " do_cp
+    if [[ "$do_cp" == "s" ]]; then
+        read -p "Mensagem do commit: " msg
+        for repo in "${repos[@]}"; do
+            cd "$repo" || continue
+            if [[ -n "$(git status --porcelain)" ]]; then
+                echo ""
+                commit_and_push "$repo" "$msg"
+            fi
+        done
+    fi
+}
+
+# Listar e clonar repositórios do GitHub via gh CLI
+gh_list_and_clone() {
+    print_header
+    echo "📦 REPOSITÓRIOS DO GITHUB"
+    echo "─────────────────────────"
+    
+    if ! command -v gh &>/dev/null; then
+        print_error "GitHub CLI (gh) não instalado"
+        return
+    fi
+    
+    if ! gh auth status 2>/dev/null; then
+        print_warning "Faça login primeiro: gh auth login"
+        read -p "Deseja fazer login agora? (s/n): " do_login
+        [[ "$do_login" == "s" ]] && gh auth login
+        return
+    fi
+    
+    local base_dir="$REPOS_DIR"
+    read -p "Diretório destino [$base_dir]: " custom_base
+    [[ -n "$custom_base" ]] && base_dir="$custom_base"
+    mkdir -p "$base_dir"
+    
+    print_info "Buscando repositórios..."
+    local repos=$(gh repo list "$GITHUB_USER" --limit 50 --json name,isFork --jq '.[] | select(.isFork==false) | .name' 2>/dev/null)
+    
+    if [[ -z "$repos" ]]; then
+        print_warning "Nenhum repositório encontrado"
+        return
+    fi
+    
+    echo ""
+    echo "Repositórios disponíveis:"
+    echo "$repos" | nl
+    
+    echo ""
+    read -p "Número do repositório para clonar (ou 'todos'): " repo_choice
+    
+    if [[ "$repo_choice" == "todos" ]]; then
+        for repo_name in $repos; do
+            local repo_url="git@github.com:$GITHUB_USER/$repo_name.git"
+            clone_or_pull_repo "$repo_url" "$base_dir/$repo_name" "$repo_name"
+        done
+    else
+        local repo_name=$(echo "$repos" | sed -n "${repo_choice}p")
+        if [[ -n "$repo_name" ]]; then
+            local repo_url="git@github.com:$GITHUB_USER/$repo_name.git"
+            clone_or_pull_repo "$repo_url" "$base_dir/$repo_name" "$repo_name"
+        else
+            print_error "Opção inválida"
+        fi
+    fi
+}
+
+# Atualizar todos os repositórios em um diretório
+update_all_repos_in_dir() {
+    local base_dir="$REPOS_DIR"
+    read -p "Diretório com repositórios [$base_dir]: " custom_base
+    [[ -n "$custom_base" ]] && base_dir="$custom_base"
+    
+    if [[ ! -d "$base_dir" ]]; then
+        print_error "Diretório não encontrado"
+        return
+    fi
+    
+    mapfile -t repos < <(list_repos "$base_dir")
+    
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        print_warning "Nenhum repositório encontrado"
+        return
+    fi
+    
+    print_info "Atualizando ${#repos[@]} repositórios..."
+    
+    for repo in "${repos[@]}"; do
+        local name=$(basename "$repo")
+        cd "$repo" || continue
+        local branch=$(detect_default_branch "$repo")
+        git stash --include-untracked 2>/dev/null
+        if git pull origin "$branch" 2>/dev/null; then
+            print_success "✓ $name"
+        else
+            print_warning "✗ $name - erro ao atualizar"
+        fi
+    done
+}
+
 # Menu principal
 show_menu() {
     while true; do
@@ -376,6 +730,7 @@ show_menu() {
         echo "4️⃣  Ver Configuração"
         echo "5️⃣  Trocar Método (Atual: ${METHOD^^})"
         echo "6️⃣  Ver Log de Atividades"
+        echo "7️⃣  🔄 Atualizar Repositórios"
         echo "0️⃣  Sair"
         echo ""
         
@@ -399,6 +754,7 @@ show_menu() {
                 echo "Repositório:    $REPO_NAME"
                 echo "Método:         $METHOD"
                 echo "Diretório:      $TARGET_DIR"
+                echo "Repositórios:   $REPOS_DIR"
                 echo ""
                 read -p "Pressione Enter para continuar..."
                 ;;
@@ -421,12 +777,15 @@ show_menu() {
                     echo ""
                     echo "📜 Log de Atividades"
                     echo "────────────────────"
-                    tail -20 "$LOG_FILE"
+                    tail -30 "$LOG_FILE"
                 else
                     print_info "Nenhum registro no log ainda."
                 fi
                 echo ""
                 read -p "Pressione Enter para continuar..."
+                ;;
+            7)
+                update_repos_menu
                 ;;
             0)
                 print_info "Saindo..."

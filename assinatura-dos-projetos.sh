@@ -46,6 +46,7 @@ load_config() {
         REPO_NAME=""
         METHOD="ssh"
         TARGET_DIR="$DEFAULT_DIR"
+        REPOS_DIR="$HOME/repos"
         SIGN_COMMITS="no"
         SIGN_TOOLS="no"
         GPG_KEY_ID=""
@@ -62,6 +63,7 @@ GITHUB_USER="$GITHUB_USER"
 REPO_NAME="$REPO_NAME"
 METHOD="$METHOD"
 TARGET_DIR="$TARGET_DIR"
+REPOS_DIR="$REPOS_DIR"
 SIGN_COMMITS="$SIGN_COMMITS"
 SIGN_TOOLS="$SIGN_TOOLS"
 GPG_KEY_ID="$GPG_KEY_ID"
@@ -562,6 +564,7 @@ show_menu() {
         echo "6️⃣  ⚙️  Configurar Git Signing"
         echo "7️⃣  📋 Status do Sistema"
         echo "8️⃣  📊 Ver Log"
+        echo "9️⃣  🔄 Atualizar Repositórios"
         echo "0️⃣  Sair"
         echo ""
         
@@ -631,6 +634,9 @@ show_menu() {
                     print_info "Nenhum registro no log"
                 fi
                 ;;
+            9)
+                update_repos_menu
+                ;;
             0)
                 print_info "Saindo..."
                 exit 0
@@ -683,10 +689,166 @@ show_system_status() {
     fi
 }
 
-# Funções auxiliares (já existentes, mantidas por compatibilidade)
+# Configurações adicionais
+REPOS_DIR="$HOME/repos"
+
+# Funções auxiliares
 setup_repo() {
-    # [Implementação anterior do setup_repo]
-    echo "Função setup_repo - implementar conforme necessidade"
+    print_header
+    echo "Configuração do Repositório"
+    echo "────────────────────────────"
+
+    if ! command -v git &> /dev/null; then
+        print_error "Git não está instalado!"
+        read -p "Instalar agora? (s/n): " install_git
+        if [[ "$install_git" == "s" ]]; then
+            sudo apt update && sudo apt install git -y
+        else
+            exit 1
+        fi
+    fi
+
+    if [[ -z "$GITHUB_USER" ]]; then
+        read -p "Digite seu usuário GitHub: " GITHUB_USER
+    else
+        echo "Usuário atual: $GITHUB_USER"
+        read -p "Alterar? (s/n): " change_user
+        [[ "$change_user" == "s" ]] && read -p "Novo usuário GitHub: " GITHUB_USER
+    fi
+
+    if [[ -z "$REPO_NAME" ]]; then
+        read -p "Nome do repositório: " REPO_NAME
+    else
+        echo "Repositório atual: $REPO_NAME"
+        read -p "Alterar? (s/n): " change_repo
+        [[ "$change_repo" == "s" ]] && read -p "Novo repositório: " REPO_NAME
+    fi
+
+    echo ""
+    echo "Método de upload:"
+    echo "1) SSH (Recomendado)"
+    echo "2) HTTPS"
+    read -p "Escolha (1/2) [atual: $METHOD]: " method_choice
+    case $method_choice in
+        1) METHOD="ssh" ;;
+        2) METHOD="https" ;;
+        "") ;;
+        *) print_warning "Opção inválida" ;;
+    esac
+
+    read -p "Diretório das ferramentas [$TARGET_DIR]: " new_dir
+    [[ -n "$new_dir" ]] && TARGET_DIR="$new_dir"
+
+    read -p "Diretório para repositórios [$REPOS_DIR]: " new_repos
+    [[ -n "$new_repos" ]] && REPOS_DIR="$new_repos"
+
+    mkdir -p "$TARGET_DIR" "$REPOS_DIR"
+    save_config
+}
+
+# Detectar branch padrão
+detect_default_branch() {
+    local repo_dir="$1"
+    cd "$repo_dir" 2>/dev/null || return
+    git branch -r | grep -oP 'origin/\K(main|master)' | head -1 || echo "main"
+}
+
+# Clonar ou atualizar repositório
+clone_or_pull_repo() {
+    local repo_url="$1"
+    local dest_dir="$2"
+    local repo_name="$3"
+
+    if [[ -d "$dest_dir/.git" ]]; then
+        print_info "Atualizando $repo_name..."
+        cd "$dest_dir" || return 1
+        local branch=$(detect_default_branch "$dest_dir")
+        git stash --include-untracked 2>/dev/null
+        git pull origin "$branch" 2>/dev/null && print_success "✓ $repo_name atualizado" || return 1
+    else
+        print_info "Clonando $repo_name..."
+        mkdir -p "$(dirname "$dest_dir")"
+        git clone "$repo_url" "$dest_dir" 2>/dev/null && print_success "✓ $repo_name clonado" || return 1
+    fi
+}
+
+# Commit e push
+commit_and_push() {
+    local repo_dir="$1"
+    local message="$2"
+    cd "$repo_dir" || return 1
+    git add -A
+    [[ -z "$(git status --porcelain)" ]] && { print_warning "Nada a commitar em $(basename "$repo_dir")"; return 0; }
+    git status --short
+    [[ -z "$message" ]] && message="Update $(date '+%Y-%m-%d %H:%M')"
+    git commit -m "$message" || return 1
+    local branch=$(git rev-parse --abbrev-ref HEAD)
+    if git push origin "$branch" 2>/dev/null; then
+        print_success "✓ $(basename "$repo_dir") enviado"
+        log_action "Update: $(basename "$repo_dir") - $message"
+    else
+        print_error "Falha no push de $(basename "$repo_dir")"
+        return 1
+    fi
+}
+
+# Menu de atualização de repositórios
+update_repos_menu() {
+    print_header
+    echo "🔄 ATUALIZAR REPOSITÓRIOS"
+    echo "─────────────────────────"
+    echo ""
+    echo "1) Atualizar repositório específico do GitHub"
+    echo "2) Digitalizar diretório por repositórios"
+    echo "3) 🔄 Atualizar TODOS os repositórios de um diretório"
+    echo "0) Voltar"
+    echo ""
+    read -p "Escolha: " choice
+
+    case $choice in
+        1)
+            [[ -z "$GITHUB_USER" ]] && read -p "Usuário GitHub: " GITHUB_USER
+            read -p "Nome do repositório: " repo_name
+            [[ -z "$repo_name" ]] && return
+            local repo_url="git@github.com:$GITHUB_USER/$repo_name.git"
+            [[ "$METHOD" == "https" ]] && repo_url="https://github.com/$GITHUB_USER/$repo_name.git"
+            local dest_dir="$REPOS_DIR/$repo_name"
+            read -p "Diretório destino [$dest_dir]: " custom_dir
+            [[ -n "$custom_dir" ]] && dest_dir="$custom_dir"
+            clone_or_pull_repo "$repo_url" "$dest_dir" "$repo_name"
+            read -p "Commit e push? (s/n): " do_cp
+            [[ "$do_cp" == "s" ]] && { read -p "Mensagem: " msg; commit_and_push "$dest_dir" "$msg"; }
+            ;;
+        2)
+            local scan_dir="$REPOS_DIR"
+            read -p "Diretório [$scan_dir]: " custom_scan
+            [[ -n "$custom_scan" ]] && scan_dir="$custom_scan"
+            [[ ! -d "$scan_dir" ]] && { print_error "Diretório não encontrado"; return; }
+            while IFS= read -r -d '' repo; do
+                local name=$(basename "$repo")
+                cd "$repo" 2>/dev/null || continue
+                local branch=$(detect_default_branch "$repo")
+                local remote=$(git remote get-url origin 2>/dev/null | sed 's/.*github.com[:\/]//;s/\.git$//')
+                local modified=$(git status --porcelain | wc -l)
+                echo -e "  ${MAGENTA}$name${NC} ($remote) - Modificados: $modified"
+            done < <(find "$scan_dir" -maxdepth 2 -name ".git" -type d -printf '%h\0' 2>/dev/null)
+            ;;
+        3)
+            local base_dir="$REPOS_DIR"
+            read -p "Diretório [$base_dir]: " custom_base
+            [[ -n "$custom_base" ]] && base_dir="$custom_base"
+            [[ ! -d "$base_dir" ]] && { print_error "Diretório não encontrado"; return; }
+            while IFS= read -r -d '' repo; do
+                local name=$(basename "$repo")
+                cd "$repo" 2>/dev/null || continue
+                local branch=$(detect_default_branch "$repo")
+                git stash --include-untracked 2>/dev/null
+                git pull origin "$branch" 2>/dev/null && print_success "✓ $name" || print_warning "✗ $name"
+            done < <(find "$base_dir" -maxdepth 2 -name ".git" -type d -printf '%h\0' 2>/dev/null)
+            ;;
+        0) return ;;
+        *) print_error "Opção inválida" ;;
+    esac
 }
 
 # Inicialização
